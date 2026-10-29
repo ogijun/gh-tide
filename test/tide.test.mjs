@@ -80,6 +80,7 @@ test("tideForCommit: 段の ref が解決できなければ present は null", a
 test("tideForPath: contents が 404 なら無い", async () => {
   const api = async (path) => {
     if (path.endsWith("ref=main")) return { type: "file" };
+    if (path.startsWith("repos/o/r/commits/")) return { sha: "x" };
     const e = new Error("HTTP 404");
     e.status = 404;
     throw e;
@@ -130,5 +131,22 @@ test("tideForCommit: 段の ref が無い（compare が 404）なら present は
   assert.deepEqual(
     rows.map((r) => r.present),
     [null, true],
+  );
+});
+
+test("tideForPath: path is missing (404) but the stage itself does not exist either → present is null", async () => {
+  const api = async (path) => {
+    const e = new Error("HTTP 404");
+    e.status = 404;
+    if (path.startsWith("repos/o/r/commits/main")) return { sha: "x" };
+    throw e;
+  };
+  const rows = await tideForPath(api, "o/r", "a.js", [
+    { label: "nope", ref: "nope" },
+    { label: "main", ref: "main" },
+  ]);
+  assert.deepEqual(
+    rows.map((r) => r.present),
+    [null, false],
   );
 });
