@@ -9,6 +9,7 @@ import {
   tideForPath,
   renderTable,
   encodePath,
+  describeSubject,
 } from "../lib/tide.mjs";
 
 test("parseArgs: サブコマンドと引数とフラグを分ける", () => {
@@ -149,4 +150,14 @@ test("tideForPath: path is missing (404) but the stage itself does not exist eit
     rows.map((r) => r.present),
     [null, false],
   );
+});
+
+test("describeSubject: says whether the merge commit or the head commit is checked", () => {
+  assert.equal(
+    describeSubject({ number: 7, title: "T", state: "open", merged_at: null, merge_commit_sha: "m", head: { sha: "abcdef1234" } }).note,
+    "PR #7 open: T\nchecking head commit abcdef1 (not merged yet)",
+  );
+  const merged = describeSubject({ number: 8, title: "U", state: "closed", merged_at: "2026-10-29", merge_commit_sha: "1234567890", head: { sha: "h" } });
+  assert.equal(merged.sha, "1234567890");
+  assert.equal(merged.note, "PR #8 merged: U\nchecking merge commit 1234567");
 });
