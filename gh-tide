@@ -1,0 +1,9 @@
+#!/usr/bin/env node
+import { main } from "./lib/tide.mjs";
+
+main(process.argv.slice(2))
+  .then((code) => process.exit(code))
+  .catch((e) => {
+    console.error(`gh tide: ${e.message}`);
+    process.exit(1);
+  });

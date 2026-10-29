@@ -1,0 +1,9 @@
+{
+  "name": "gh-tide",
+  "private": true,
+  "type": "module",
+  "description": "gh extension: see which branches and tags a commit, PR, or path has reached",
+  "scripts": { "test": "node --test" },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
