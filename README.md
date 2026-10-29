@@ -43,7 +43,7 @@ Options:
 A stage is one of:
 
 - a branch name, such as `develop` or `main`
-- `tag:<regex>`, which picks the tag with the greatest name that matches (works well with date-stamped tags such as `prod-YYYYMMDD-HHMMSS`)
+- `tag:<regex>`, which picks the tag with the greatest name that matches (works well with date-stamped tags such as `prod-YYYYMMDD-HHMMSS`; only the first 1,000 tags are read)
 - `release`, the tag of the latest GitHub release
 
 Stages come from `--stages`, then from `git config tide.stages` in the current repository, and finally default to `<default branch>,release`.
@@ -56,6 +56,8 @@ git config tide.stages "develop,staging,main,tag:^prod-"
 
 - Commits and PRs: `GET /repos/{owner}/{repo}/compare/{stage}...{sha}`. The change is on the stage when the status is `identical` or `behind`.
 - Paths: `GET /repos/{owner}/{repo}/contents/{path}?ref={stage}`. A 404 means the path is not there.
+
+A stage whose branch or tag does not exist shows `?`.
 
 If a stage was promoted with a squash merge or a cherry-pick, the original commit is not an ancestor of that stage, and `gh tide` reports it as missing. Use `gh tide path` for those flows.
 

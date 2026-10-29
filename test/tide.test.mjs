@@ -8,6 +8,7 @@ import {
   tideForCommit,
   tideForPath,
   renderTable,
+  encodePath,
 } from "../lib/tide.mjs";
 
 test("parseArgs: サブコマンドと引数とフラグを分ける", () => {
@@ -102,4 +103,32 @@ test("renderTable: 段ごとに ✓ ✗ ? を並べる", () => {
   assert.match(out, /✓\s+develop/);
   assert.match(out, /✗\s+tag:\^prod-\s+\(prod-1\)/);
   assert.match(out, /\?\s+release/);
+});
+
+test("parseArgs: 値が要るフラグに値が無ければエラー", () => {
+  assert.throws(() => parseArgs(["pr", "1", "-R"]));
+  assert.throws(() => parseArgs(["pr", "1", "--stages", "--json"]));
+});
+
+test("encodePath: ? や # も含めて各要素をエンコードし、先頭の / を落とす", () => {
+  assert.equal(encodePath("/a b/c?d#e.js"), "a%20b/c%3Fd%23e.js");
+});
+
+test("tideForCommit: 段の ref が無い（compare が 404）なら present は null で、他の段は続ける", async () => {
+  const api = async (path) => {
+    if (path.includes("compare/nope...")) {
+      const e = new Error("HTTP 404");
+      e.status = 404;
+      throw e;
+    }
+    return { status: "identical" };
+  };
+  const rows = await tideForCommit(api, "o/r", "abc", [
+    { label: "nope", ref: "nope" },
+    { label: "main", ref: "main" },
+  ]);
+  assert.deepEqual(
+    rows.map((r) => r.present),
+    [null, true],
+  );
 });
