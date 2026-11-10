@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative "lib/tide"
+
+begin
+  exit GhTide.main(ARGV)
+rescue StandardError => e
+  $stderr.print "gh tide: #{e.message}\n"
+  exit 1
+end
