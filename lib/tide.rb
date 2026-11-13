@@ -3,6 +3,8 @@
 require "json"
 require "open3"
 
+require_relative "stuck"
+
 module GhTide
   class Error < StandardError; end
 
