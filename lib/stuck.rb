@@ -68,7 +68,7 @@ module GhTide
 
     def parse_args(argv)
       out = { author: "@me", owner: nil, repo: nil, min_age: nil, json: false, merged_unreleased: false,
-              since: 30 * 86_400, stages: nil, help: false }
+              since: 30 * 86_400, since_label: "30d", stages: nil, help: false }
       value = lambda do |i, flag|
         v = argv[i]
         raise Error, "#{flag} needs a value" if v.nil? || v.start_with?("-")
@@ -85,7 +85,9 @@ module GhTide
         when "--min-age"
           out[:min_age_label] = value.call(i += 1, a)
           out[:min_age] = parse_duration(out[:min_age_label])
-        when "--since" then out[:since] = parse_duration(value.call(i += 1, a))
+        when "--since"
+          out[:since_label] = value.call(i += 1, a)
+          out[:since] = parse_duration(out[:since_label])
         when "--stages" then out[:stages] = value.call(i += 1, a)
         when "--merged-unreleased" then out[:merged_unreleased] = true
         when "--json" then out[:json] = true
@@ -380,6 +382,21 @@ module GhTide
       }
     GRAPHQL
 
+    MERGED_QUERY = <<~'GRAPHQL'
+      query($q: String!, $after: String) {
+        search(query: $q, type: ISSUE, first: 100, after: $after) {
+          issueCount
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            ... on PullRequest {
+              number title url mergedAt mergeCommit { oid }
+              repository { nameWithOwner defaultBranchRef { name } }
+            }
+          }
+        }
+      }
+    GRAPHQL
+
     PR_QUERY = <<~'GRAPHQL'
       query($owner: String!, $name: String!, $number: Int!) {
         repository(owner: $owner, name: $name) {
@@ -457,19 +474,25 @@ module GhTide
       yield
     end
 
-    def search(gql, query, sleeper)
+    # Search result nodes (up to the 1,000-result limit) and the total GitHub reports
+    def search_nodes(gql, query, sleeper, graphql = SEARCH_QUERY)
       found = []
       after = nil
       total = 0
       10.times do
-        page = with_retry(sleeper) { gql.call(SEARCH_QUERY, { q: query, after: after }) }["search"]
+        page = with_retry(sleeper) { gql.call(graphql, { q: query, after: after }) }["search"]
         total = page["issueCount"]
-        found.concat(page["nodes"].filter_map { |n| n["number"] && { repo: n.dig("repository", "nameWithOwner"), number: n["number"] } })
+        found.concat(page["nodes"].select { |n| n["number"] })
         break unless page.dig("pageInfo", "hasNextPage")
 
         after = page.dig("pageInfo", "endCursor")
       end
       [found, total]
+    end
+
+    def search(gql, query, sleeper)
+      found, total = search_nodes(gql, query, sleeper)
+      [found.map { |n| { repo: n.dig("repository", "nameWithOwner"), number: n["number"] } }, total]
     end
 
     def fetch_pr(gql, repo, number, sleeper)
@@ -539,6 +562,53 @@ module GhTide
       { rows: rows, errors: errors, total: total, found: found.length }
     end
 
+    def merged_query(author, owner, repo, since_time)
+      "is:pr is:merged author:#{author} merged:>=#{since_time.getutc.strftime("%Y-%m-%d")}#{scope_qualifier(owner, repo)}"
+    end
+
+    # Merged PRs whose merge commit has not reached the last stage of their repository.
+    # stage_spec returns the stage list for a repository, or nil for "<default branch>,release".
+    def load_unreleased(gql, api, opts, now, sleeper, stage_spec)
+      nodes, total = search_nodes(gql, merged_query(opts[:author], opts[:owner], opts[:repo], now - opts[:since]), sleeper, MERGED_QUERY)
+      rows = []
+      skipped = []
+      nodes.group_by { |n| n.dig("repository", "nameWithOwner") }.each do |repo, prs|
+        spec = stage_spec.call(repo) || "#{prs.first.dig("repository", "defaultBranchRef", "name")},release"
+        last = GhTide.parse_stages(spec).last
+        resolved = GhTide.resolve_stages(api, repo, [last])
+        if GhTide.unresolved?(resolved[0][:ref])
+          skipped << { repo: repo, stage: resolved[0][:label], count: prs.length, error: "the stage could not be resolved" }
+          next
+        end
+        found = pool(prs, 4) do |n|
+          row = GhTide.tide_for_commit(api, repo, n.dig("mergeCommit", "oid"), resolved)[0]
+          next nil unless row[:present] == false
+
+          merged_at = time(n["mergedAt"])
+          { repo: repo, number: n["number"], title: n["title"], url: n["url"], merged_at: merged_at,
+            merged_days: days(merged_at, now), stage: row[:label], ref: row[:ref] }
+        end
+        rows.concat(found.compact)
+      rescue Error => e
+        skipped << { repo: repo, stage: nil, count: prs.length, error: first_line(e.message) }
+      end
+      { rows: rows.sort_by { |r| [r[:merged_at], r[:repo], r[:number]] }, skipped: skipped, total: total, found: nodes.length }
+    end
+
+    def render_unreleased(result, since_label)
+      rows = result[:rows]
+      lines = ["", "merged-unreleased (#{rows.length}) — merged in the last #{since_label}, not yet on the last stage"]
+      ref_width = rows.map { |x| "#{x[:repo]}##{x[:number]}".length }.max
+      rows.each do |x|
+        lines << "  #{"#{x[:repo]}##{x[:number]}".ljust(ref_width)}  #{"merged #{x[:merged_days]}d ago".ljust(16)}  #{truncate(x[:title], 72)}"
+        lines << "      not on #{x[:stage]}#{" (#{x[:ref]})" if x[:ref] != x[:stage]}"
+      end
+      result[:skipped].each do |s|
+        lines << "Skipped #{s[:repo]} (#{plural(s[:count], "PR")}): #{[s[:stage], s[:error]].compact.join(": ")}"
+      end
+      lines.join("\n")
+    end
+
     def json_row(r)
       {
         repo: r[:repo], number: r[:number], title: r[:title], url: r[:url],
@@ -548,13 +618,30 @@ module GhTide
       }
     end
 
-    def main(argv, gql: method(:gh_graphql), out: $stdout, now: Time.now, sleeper: ->(s) { sleep(s) })
+    # --stages, otherwise git config tide.stages when the repository is the current one
+    def default_stage_spec(opts)
+      return ->(_) { opts[:stages] } if opts[:stages]
+
+      current = begin
+        GhTide.current_repo
+      rescue Error
+        nil
+      end
+      config = current && GhTide.git_config("tide.stages")
+      ->(repo) { repo == current ? config : nil }
+    end
+
+    def main(argv, gql: method(:gh_graphql), api: GhTide.method(:gh_api), out: $stdout, now: Time.now,
+             sleeper: ->(s) { sleep(s) }, stage_spec: nil)
       opts = parse_args(argv)
       if opts[:help]
         out.print(HELP)
         return 0
       end
       result = load_open(gql, opts, now, sleeper)
+      if opts[:merged_unreleased]
+        unreleased = load_unreleased(gql, api, opts, now, sleeper, stage_spec || default_stage_spec(opts))
+      end
       rows = result[:rows]
       who = opts[:author]
       scope = opts[:repo] || opts[:owner]
@@ -567,7 +654,9 @@ module GhTide
           counts: REASONS.to_h { |r| [r, rows.count { |x| x[:reason] == r }] }.reject { |_, n| n.zero? },
           prs: rows.sort_by { |r| [REASONS.index(r[:reason]), -(r[:age_days] || 0)] }.map { |r| json_row(r) },
           errors: result[:errors],
-          truncated: result[:total] > result[:found]
+          truncated: result[:total] > result[:found],
+          **(unreleased ? { mergedUnreleased: unreleased[:rows].map { |r| r.merge(merged_at: r[:merged_at]&.iso8601) },
+                            mergedUnreleasedSkipped: unreleased[:skipped] } : {})
         ), "\n")
         return 0
       end
@@ -576,6 +665,7 @@ module GhTide
       if result[:total] > result[:found]
         out.print("Note: search returned only #{result[:found]} of #{result[:total]} PRs (the 1,000-result limit).\n")
       end
+      out.print(render_unreleased(unreleased, opts[:since_label]), "\n") if unreleased
       0
     end
   end
