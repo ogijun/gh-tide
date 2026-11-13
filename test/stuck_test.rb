@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "stringio"
 require "tide"
 
 class StuckTest < Minitest::Test
@@ -241,6 +242,21 @@ class StuckTest < Minitest::Test
     assert_equal ["ready-to-merge"], r[:reasons]
   end
 
+  # Inline comments that came with an approval are part of it
+  def test_inline_comments_of_an_approval_need_no_reply
+    r = classify(reviewThreads: { "nodes" => [{ "isResolved" => false, "comments" => { "nodes" => [
+      { "author" => user("bob"), "createdAt" => "2026-01-19T01:00:00Z", "pullRequestReview" => { "state" => "APPROVED" } }
+    ] } }] })
+    assert_equal ["ready-to-merge"], r[:reasons]
+  end
+
+  def test_unresolved_review_comment_awaits_a_reply
+    r = classify(reviewThreads: { "nodes" => [{ "isResolved" => false, "comments" => { "nodes" => [
+      { "author" => user("bob"), "createdAt" => "2026-01-19T01:00:00Z", "pullRequestReview" => { "state" => "COMMENTED" } }
+    ] } }] })
+    assert_equal "awaiting-reply", r[:reason]
+  end
+
   def test_ci_pending_is_reported_when_nothing_else_blocks
     r = classify(**checks(check("test", nil, status: "QUEUED")))
     assert_equal ["ci-pending"], r[:reasons]
@@ -297,5 +313,109 @@ class StuckTest < Minitest::Test
     assert_match(/ci-failing\s+2\n\s+ready-to-merge\s+1/, out)
     assert_operator out.index("acme/web#9"), :<, out.index("acme/api#2")
     assert_match(/acme\/web#9\s+30d old, idle 5d\s+Older\n\s+failing: lint; also waiting-review/, out)
+  end
+
+  def test_render_names_the_parent_of_a_stacked_pr
+    rows = [{ repo: "acme/api", number: 8, title: "Child", reason: "waiting-review", reasons: %w[waiting-review stacked],
+              details: { "waiting-review" => "no reviewer requested" }, age_days: 1, idle_days: 1, parent: 6 }]
+    assert_match(/no reviewer requested; also stacked on #6/, GhTide::Stuck.render(rows, header: "1 open PR"))
+  end
+
+  def test_gh_tide_dispatches_stuck
+    out = StringIO.new
+    assert_equal 0, GhTide.main(%w[stuck --help], nil, out)
+    assert_match(/gh tide stuck \[options\]/, out.string)
+  end
+
+  # ---- gh I/O, with a fake GraphQL transport ----
+
+  def search_page(numbers, next_cursor = nil)
+    { "search" => { "issueCount" => 3, "pageInfo" => { "hasNextPage" => !next_cursor.nil?, "endCursor" => next_cursor },
+                    "nodes" => numbers.map { |n| { "number" => n, "repository" => { "nameWithOwner" => "acme/api" } } } } }
+  end
+
+  def test_search_follows_pages
+    pages = { nil => search_page([1, 2], "c1"), "c1" => search_page([3]) }
+    found, total = GhTide::Stuck.search(->(_q, v) { pages.fetch(v[:after]) }, "is:pr", ->(_) {})
+    assert_equal [1, 2, 3], found.map { |f| f[:number] }
+    assert_equal 3, total
+  end
+
+  # Right after many merges mergeability is often UNKNOWN; it is fetched once more
+  def test_fetch_pr_asks_again_when_mergeability_is_unknown
+    answers = [pr_node(mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN"), pr_node]
+    sleeps = []
+    node = GhTide::Stuck.fetch_pr(->(_q, _v) { { "repository" => { "pullRequest" => answers.shift } } }, "acme/api", 7, ->(s) { sleeps << s })
+    assert_equal "MERGEABLE", node["mergeable"]
+    assert_equal 1, sleeps.length
+  end
+
+  # GraphQL sometimes answers with an HTML page; that is retried once
+  def test_html_response_is_retried_once
+    calls = 0
+    gql = lambda do |_q, _v|
+      calls += 1
+      raise GhTide::ApiError, "unexpected response from GraphQL" if calls == 1
+
+      { "repository" => { "pullRequest" => pr_node } }
+    end
+    GhTide::Stuck.fetch_pr(gql, "acme/api", 7, ->(_) {})
+    assert_equal 2, calls
+  end
+
+  def test_client_errors_are_not_retried
+    calls = 0
+    gql = lambda do |_q, _v|
+      calls += 1
+      raise GhTide::ApiError.new("HTTP 401", status: 401)
+    end
+    assert_raises(GhTide::ApiError) { GhTide::Stuck.fetch_pr(gql, "acme/api", 7, ->(_) {}) }
+    assert_equal 1, calls
+  end
+
+  def test_main_prints_reasons_and_parent_of_stacked_prs
+    child = pr_node(number: 8, title: "Child", baseRefName: "feature/parent")
+    gql = lambda do |q, v|
+      if q.include?("search(") then search_page([7, 8])
+      elsif q.include?("pullRequests(headRefName") then { "repository" => { "pullRequests" => { "nodes" => [{ "number" => 6, "headRepository" => { "nameWithOwner" => "acme/api" } }] } } }
+      elsif v[:number] == 8 then { "repository" => { "pullRequest" => child } }
+      else { "repository" => { "pullRequest" => pr_node } }
+      end
+    end
+    out = StringIO.new
+    assert_equal 0, GhTide::Stuck.main([], gql: gql, out: out, now: NOW, sleeper: ->(_) {})
+    text = out.string
+    assert_match(/2 open PRs by @me, drafts excluded/, text)
+    assert_match(/stacked\s+1\n\s+ready-to-merge\s+1/, text)
+    assert_match(%r{acme/api#8 .*\n\s+on #6 \(feature/parent\)}, text)
+    assert_match(/Note: search returned only 2 of 3 PRs/, text)
+  end
+
+  def test_main_json_and_min_age
+    gql = lambda do |q, v|
+      next search_page([7, 8]) if q.include?("search(")
+
+      created = v[:number] == 8 ? "2026-01-20T00:00:00Z" : "2026-01-10T12:00:00Z"
+      { "repository" => { "pullRequest" => pr_node(number: v[:number], createdAt: created) } }
+    end
+    out = StringIO.new
+    GhTide::Stuck.main(%w[--min-age 3d --json], gql: gql, out: out, now: NOW, sleeper: ->(_) {})
+    data = JSON.parse(out.string)
+    assert_equal [7], data["prs"].map { |p| p["number"] }
+    assert_equal({ "ready-to-merge" => 1 }, data["counts"])
+    assert_equal "ready-to-merge", data["prs"][0]["reason"]
+  end
+
+  # One PR that cannot be read is reported, not fatal
+  def test_main_reports_a_pr_it_could_not_read
+    gql = lambda do |q, v|
+      next search_page([7, 8]) if q.include?("search(")
+      raise GhTide::ApiError.new("HTTP 404: Not Found", status: 404) if v[:number] == 8
+
+      { "repository" => { "pullRequest" => pr_node } }
+    end
+    out = StringIO.new
+    GhTide::Stuck.main([], gql: gql, out: out, now: NOW, sleeper: ->(_) {})
+    assert_match(%r{Could not read acme/api#8: HTTP 404}, out.string)
   end
 end
