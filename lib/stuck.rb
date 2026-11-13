@@ -20,7 +20,7 @@ module GhTide
       "stacked" => "waits for its parent PR",
       "ci-pending" => "checks are still running",
       "ready-to-merge" => "approved, green, no conflicts; only the merge is left",
-      "unknown" => "GitHub did not report whether it can merge"
+"unknown" => "nothing above applies, but GitHub does not report it as mergeable (see the merge state)"
     }.freeze
 
     HELP = <<~'TEXT'
@@ -52,10 +52,15 @@ module GhTide
         ready-to-merge     approved, green, no conflicts
     TEXT
 
-    FAILED = %w[FAILURE TIMED_OUT STARTUP_FAILURE ACTION_REQUIRED ERROR].freeze
+# BLOCKED and BEHIND mean GitHub will not merge it yet (unresolved conversations, out of date, ...)
+MERGEABLE_STATES = %w[CLEAN HAS_HOOKS UNSTABLE].freeze
+FAILED = %w[FAILURE TIMED_OUT STARTUP_FAILURE ACTION_REQUIRED ERROR].freeze
     OK = %w[SUCCESS NEUTRAL SKIPPED STALE].freeze
 
-    module_function
+# A failure worth one retry: a 5xx, or an HTML page instead of JSON
+class TransientError < ApiError; end
+
+module_function
 
     # ---- options ----
 
@@ -142,7 +147,7 @@ module GhTide
               end
       run = c.dig("checkSuite", "workflowRun")
       {
-        name: c["name"], state: state, required: c["isRequired"] == true, at: c["startedAt"].to_s,
+name: c["name"], state: state, required: c["isRequired"] == true, at: c["startedAt"] || "9999",
         workflow_id: run && run.dig("workflow", "databaseId"), event: run && run["event"],
         run_id: run && run["databaseId"], run_number: run && run["runNumber"]
       }
@@ -161,7 +166,10 @@ module GhTide
       nodes(node, "comments").each { |c| conversation << { author: c["author"], at: c["createdAt"], reply: true } }
       nodes(node, "reviews").each do |r|
         # An approval answers the conversation; a comment or change request asks for a reply
-        conversation << { author: r["author"], at: r["submittedAt"], reply: r["state"] != "APPROVED" }
+# An empty non-approval review only wraps inline comments, which are counted with their threads
+next if r["state"] == "DISMISSED" || (r["state"] != "APPROVED" && r["body"].to_s.strip.empty?)
+
+conversation << { author: r["author"], at: r["submittedAt"], reply: r["state"] != "APPROVED" }
       end
       nodes(node, "reviewThreads").each do |t|
         next if t["isResolved"]
@@ -190,7 +198,9 @@ module GhTide
           .map { |r| { login: r.dig("author", "login"), state: r["state"], at: time(r["submittedAt"]), commit: r.dig("commit", "oid") } },
         requested: nodes(node, "reviewRequests").map { |r| requested_name(r) }.compact,
         history: nodes(node, "history").map { |c| { oid: c.dig("commit", "oid"), merge: c.dig("commit", "parents", "totalCount").to_i > 1 } },
-        checks: nodes(rollup, "contexts").map { |c| normalize_check(c) },
+history_complete: node.dig("history", "totalCount").to_i <= nodes(node, "history").length,
+checks: nodes(rollup, "contexts").map { |c| normalize_check(c) },
+checks_complete: rollup.dig("contexts", "totalCount").to_i <= nodes(rollup, "contexts").length,
         conversation: conversation
           .reject { |e| bot?(e[:author]) || e[:at].nil? }
           .map { |e| { login: e[:author]["login"], at: time(e[:at]), reply: e[:reply] } }
@@ -215,7 +225,8 @@ module GhTide
       # Re-running failed jobs keeps the run id; the latest attempt of each job wins
       latest = ->(list, key) { list.group_by(&key).values.map { |g| g.max_by { |c| c[:at] } } }
       kept = latest.call(actions.select { |c| newest_runs.include?(c[:run_id]) }, ->(c) { [c[:run_id], c[:name]] })
-      ok_runs = actions.group_by { |c| c[:run_id] }.select { |_, g| g.all? { |c| c[:state] == "ok" } }
+attempts = latest.call(actions, ->(c) { [c[:run_id], c[:name]] })
+ok_runs = attempts.group_by { |c| c[:run_id] }.select { |_, g| g.all? { |c| c[:state] == "ok" } }
       succeeded = ok_runs.values.map { |g| g.first[:workflow_id] }.uniq
       kept = kept.map do |c|
         c[:state] == "cancelled" && succeeded.include?(c[:workflow_id]) ? c.merge(state: "ok", looks_red: true) : c
@@ -272,7 +283,11 @@ module GhTide
       return nil if last.nil? || last[:commit].nil? || last[:commit] == pr[:head_oid]
 
       idx = pr[:history].index { |c| c[:oid] == last[:commit] }
-      return "approved commit #{short(last[:commit])} is no longer on the branch" if idx.nil?
+if idx.nil?
+  return "approved at #{short(last[:commit])}, more than #{pr[:history].length} commits ago" unless pr.fetch(:history_complete, true)
+
+  return "approved commit #{short(last[:commit])} is no longer on the branch"
+end
 
       added = pr[:history][(idx + 1)..].reject { |c| c[:merge] }
       return nil if added.empty?
@@ -315,12 +330,15 @@ module GhTide
 
       found["ci-pending"] = "running: #{list(ci[:pending])}" if ci[:state] == "pending" && found.empty?
 
-      mergeable = pr[:mergeable] == "MERGEABLE"
+mergeable = pr[:mergeable] == "MERGEABLE" && MERGEABLE_STATES.include?(pr[:merge_state]) && pr.fetch(:checks_complete, true)
       blocking = found.keys - ["awaiting-reply"]
       if approved && !stale && !stacked && mergeable && blocking.empty? && ci[:state] != "pending"
         found["ready-to-merge"] = "approved by #{list(rv[:approvals].map { |r| r[:login] })}"
       end
-      found["unknown"] = "mergeable: #{pr[:mergeable]}, merge state: #{pr[:merge_state]}" if found.empty?
+if found.empty?
+  found["unknown"] = "mergeable: #{pr[:mergeable]}, merge state: #{pr[:merge_state]}"
+  found["unknown"] += ", only the first 100 checks were read" unless pr.fetch(:checks_complete, true)
+end
 
       reasons = REASONS.select { |r| found.key?(r) }
       active = last_activity(pr) || now
@@ -409,16 +427,17 @@ module GhTide
               nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } ... on Bot { login } ... on Mannequin { login } } }
             }
             latestOpinionatedReviews(first: 50) { nodes { state submittedAt author { __typename login } commit { oid } } }
-            reviews(last: 30) { nodes { state submittedAt author { __typename login } } }
+            reviews(last: 30) { nodes { state body submittedAt author { __typename login } } }
             comments(last: 30) { nodes { createdAt author { __typename login } } }
             reviewThreads(last: 50) { nodes { isResolved comments(last: 1) { nodes { createdAt author { __typename login } pullRequestReview { state } } } } }
-            history: commits(last: 100) { nodes { commit { oid parents { totalCount } } } }
+            history: commits(last: 100) { totalCount nodes { commit { oid parents { totalCount } } } }
             headCommit: commits(last: 1) {
               nodes {
                 commit {
                   oid committedDate
                   statusCheckRollup {
                     contexts(first: 100) {
+                      totalCount
                       nodes {
                         __typename
                         ... on CheckRun {
@@ -458,17 +477,21 @@ module GhTide
       body["data"]
     rescue CommandFailed => e
       m = e.stderr.match(/HTTP (\d{3})/)
-      raise ApiError.new((e.stderr.empty? ? e.message : e.stderr).strip, status: m && m[1].to_i)
+message = (e.stderr.empty? ? e.message : e.stderr).strip
+# gh itself fails to parse an HTML error page ("invalid character '<'")
+raise TransientError, message if m.nil? && e.stderr.match?(/invalid character .<.|unexpected end of JSON|timeout|connection reset/i)
+
+raise ApiError.new(message, status: m && m[1].to_i)
     rescue JSON::ParserError => e
       # GitHub sometimes answers a heavy GraphQL request with an HTML error page
-      raise ApiError, "unexpected response from GraphQL: #{e.message[0, 80]}"
+      raise TransientError, "unexpected response from GraphQL: #{e.message[0, 80]}"
     end
 
     # Retry once on errors that are not the caller's fault (5xx, HTML instead of JSON, timeouts)
     def with_retry(sleeper)
       yield
     rescue ApiError => e
-      raise if e.status && e.status < 500
+raise unless e.is_a?(TransientError) || e.status.to_i >= 500
 
       sleeper.call(2)
       yield
@@ -477,28 +500,35 @@ module GhTide
     # Search result nodes (up to the 1,000-result limit) and the total GitHub reports
     def search_nodes(gql, query, sleeper, graphql = SEARCH_QUERY)
       found = []
+      seen = 0
       after = nil
       total = 0
       10.times do
         page = with_retry(sleeper) { gql.call(graphql, { q: query, after: after }) }["search"]
         total = page["issueCount"]
-        found.concat(page["nodes"].select { |n| n["number"] })
+seen += page["nodes"].length
+found.concat(page["nodes"].select { |n| n["number"] })
         break unless page.dig("pageInfo", "hasNextPage")
 
         after = page.dig("pageInfo", "endCursor")
       end
-      [found, total]
+[found, total, seen]
     end
 
     def search(gql, query, sleeper)
-      found, total = search_nodes(gql, query, sleeper)
-      [found.map { |n| { repo: n.dig("repository", "nameWithOwner"), number: n["number"] } }, total]
+found, total, seen = search_nodes(gql, query, sleeper)
+      [found.map { |n| { repo: n.dig("repository", "nameWithOwner"), number: n["number"] } }, total, seen]
     end
 
     def fetch_pr(gql, repo, number, sleeper)
       owner, name = repo.split("/", 2)
       vars = { owner: owner, name: name, number: number }
-      get = -> { with_retry(sleeper) { gql.call(PR_QUERY, vars) }.dig("repository", "pullRequest") }
+get = lambda do
+  found = with_retry(sleeper) { gql.call(PR_QUERY, vars) }.dig("repository", "pullRequest")
+  raise ApiError, "the PR was not found or is not accessible" if found.nil?
+
+  found
+end
       node = get.call
       # Right after many merges GitHub often has not computed mergeability yet; ask once more
       if node["mergeable"] == "UNKNOWN" || node["mergeStateStatus"] == "UNKNOWN"
@@ -542,7 +572,7 @@ module GhTide
     end
 
     def load_open(gql, opts, now, sleeper)
-      found, total = search(gql, search_query(opts[:author], opts[:owner], opts[:repo]), sleeper)
+      found, total, seen = search(gql, search_query(opts[:author], opts[:owner], opts[:repo]), sleeper)
       results = pool(found, 4) do |f|
         pr = normalize(fetch_pr(gql, f[:repo], f[:number], sleeper))
         if pr[:default_branch] && pr[:base] != pr[:default_branch]
@@ -559,7 +589,7 @@ module GhTide
       end
       errors, rows = results.partition { |r| r[:error] }
       rows = rows.select { |r| r[:created_at] && now - r[:created_at] >= opts[:min_age] } if opts[:min_age]
-      { rows: rows, errors: errors, total: total, found: found.length }
+      { rows: rows, errors: errors, total: total, found: seen }
     end
 
     def merged_query(author, owner, repo, since_time)
@@ -569,7 +599,7 @@ module GhTide
     # Merged PRs whose merge commit has not reached the last stage of their repository.
     # stage_spec returns the stage list for a repository, or nil for "<default branch>,release".
     def load_unreleased(gql, api, opts, now, sleeper, stage_spec)
-      nodes, total = search_nodes(gql, merged_query(opts[:author], opts[:owner], opts[:repo], now - opts[:since]), sleeper, MERGED_QUERY)
+      nodes, total, seen = search_nodes(gql, merged_query(opts[:author], opts[:owner], opts[:repo], now - opts[:since]), sleeper, MERGED_QUERY)
       rows = []
       skipped = []
       nodes.group_by { |n| n.dig("repository", "nameWithOwner") }.each do |repo, prs|
@@ -581,18 +611,29 @@ module GhTide
           next
         end
         found = pool(prs, 4) do |n|
-          row = GhTide.tide_for_commit(api, repo, n.dig("mergeCommit", "oid"), resolved)[0]
+          merged_at = time(n["mergedAt"])
+          # The search takes whole days; keep the exact window
+          next nil if merged_at.nil? || now - merged_at > opts[:since]
+
+          oid = n.dig("mergeCommit", "oid")
+          next { error: "##{n["number"]}: no merge commit" } if oid.nil?
+
+          row = GhTide.tide_for_commit(api, repo, oid, resolved)[0]
           next nil unless row[:present] == false
 
-          merged_at = time(n["mergedAt"])
           { repo: repo, number: n["number"], title: n["title"], url: n["url"], merged_at: merged_at,
             merged_days: days(merged_at, now), stage: row[:label], ref: row[:ref] }
+        rescue Error => e
+          # One PR that cannot be checked should not hide the rest of the repository
+          { error: "##{n["number"]}: #{first_line(e.message)}" }
         end
-        rows.concat(found.compact)
+        failed, ok = found.compact.partition { |r| r[:error] }
+        failed.each { |f| skipped << { repo: repo, stage: nil, count: 1, error: f[:error] } }
+        rows.concat(ok)
       rescue Error => e
         skipped << { repo: repo, stage: nil, count: prs.length, error: first_line(e.message) }
       end
-      { rows: rows.sort_by { |r| [r[:merged_at], r[:repo], r[:number]] }, skipped: skipped, total: total, found: nodes.length }
+      { rows: rows.sort_by { |r| [r[:merged_at], r[:repo], r[:number]] }, skipped: skipped, total: total, found: seen }
     end
 
     def render_unreleased(result, since_label)
