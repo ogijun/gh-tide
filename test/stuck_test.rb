@@ -355,7 +355,7 @@ class StuckTest < Minitest::Test
     calls = 0
     gql = lambda do |_q, _v|
       calls += 1
-      raise GhTide::ApiError, "unexpected response from GraphQL" if calls == 1
+      raise GhTide::Stuck::TransientError, "unexpected response from GraphQL" if calls == 1
 
       { "repository" => { "pullRequest" => pr_node } }
     end
@@ -478,5 +478,113 @@ class StuckTest < Minitest::Test
     GhTide::Stuck.main(%w[--merged-unreleased --since 2w], gql: merged_gql([merged_node(4, "x")]), api: api, out: out,
                                                           now: NOW, sleeper: ->(_) {}, stage_spec: ->(_) {})
     assert_match(%r{merged-unreleased \(1\) — merged in the last 2w, not yet on the last stage\n  acme/api#4  merged 5d ago\s+Merged 4\n      not on release \(v1\.2\.0\)}, out.string)
+  end
+
+  # ---- edge cases found in review ----
+
+  # GitHub will not merge it yet (e.g. unresolved conversations or an out-of-date branch)
+  def test_blocked_merge_state_is_not_ready
+    r = classify(mergeStateStatus: "BLOCKED")
+    assert_equal "unknown", r[:reason]
+    assert_match(/merge state: BLOCKED/, r[:details]["unknown"])
+  end
+
+  def test_unstable_merge_state_is_still_ready
+    assert_equal "ready-to-merge", classify(mergeStateStatus: "UNSTABLE")[:reason]
+  end
+
+  # More than 100 commits: an approved commit outside the window is not called gone
+  def test_approval_older_than_the_fetched_history
+    r = classify(latestOpinionatedReviews: { "nodes" => [review("alice", "APPROVED", oid: OLD)] },
+                 history: { "totalCount" => 150, "nodes" => [{ "commit" => { "oid" => HEAD, "parents" => { "totalCount" => 1 } } }] })
+    assert_equal "approved at aaaaaaa, more than 1 commits ago", r[:details]["re-review"]
+  end
+
+  def test_truncated_checks_are_not_ready
+    node = checks(check("test", "SUCCESS"))
+    node["headCommit"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["totalCount"] = 150
+    assert_equal "unknown", classify(**node)[:reason]
+  end
+
+  # A re-queued job has no startedAt yet; it is the newest attempt
+  def test_requeued_job_without_start_time_is_pending
+    pr = GhTide::Stuck.normalize(pr_node(**checks(
+      check("test", "FAILURE", workflow: 1, run: 100),
+      check("test", nil, status: "QUEUED", workflow: 1, run: 100, at: nil)
+    )))
+    assert_equal "pending", GhTide::Stuck.ci_status(pr[:checks])[:state]
+  end
+
+  # A run that passed on re-run counts as a success, so a cancelled duplicate is forgiven
+  def test_run_fixed_by_rerun_forgives_a_cancelled_duplicate
+    pr = GhTide::Stuck.normalize(pr_node(**checks(
+      check("test", "FAILURE", workflow: 1, run: 100, number: 5, event: "push", at: "2026-01-19T10:00:00Z"),
+      check("test", "SUCCESS", workflow: 1, run: 100, number: 5, event: "push", at: "2026-01-19T11:00:00Z"),
+      check("test", "CANCELLED", workflow: 1, run: 101, number: 6)
+    )))
+    assert_equal "passing", GhTide::Stuck.ci_status(pr[:checks])[:state]
+  end
+
+  # An empty COMMENTED review only wraps inline comments; resolved threads owe nothing
+  def test_empty_commented_review_with_resolved_threads_needs_no_reply
+    r = classify(reviews: { "nodes" => [{ "state" => "COMMENTED", "body" => "", "submittedAt" => "2026-01-19T00:00:00Z", "author" => user("bob") }] })
+    assert_equal ["ready-to-merge"], r[:reasons]
+  end
+
+  def test_review_with_a_body_awaits_a_reply
+    r = classify(reviews: { "nodes" => [{ "state" => "COMMENTED", "body" => "Why?", "submittedAt" => "2026-01-19T00:00:00Z", "author" => user("bob") }] })
+    assert_equal "awaiting-reply", r[:reason]
+  end
+
+  # A GraphQL error (no HTTP status, not an HTML page) is not worth retrying
+  def test_graphql_errors_are_not_retried
+    calls = 0
+    gql = lambda do |_q, _v|
+      calls += 1
+      raise GhTide::ApiError, "Could not resolve to a Repository"
+    end
+    assert_raises(GhTide::ApiError) { GhTide::Stuck.fetch_pr(gql, "acme/api", 7, ->(_) {}) }
+    assert_equal 1, calls
+  end
+
+  def test_missing_pr_is_a_clear_error
+    err = assert_raises(GhTide::ApiError) do
+      GhTide::Stuck.fetch_pr(->(_q, _v) { { "repository" => { "pullRequest" => nil } } }, "acme/api", 7, ->(_) {})
+    end
+    assert_match(/not found or is not accessible/, err.message)
+  end
+
+  # Results that could not be read still count, so they do not look like the 1,000-result limit
+  def test_unreadable_search_results_do_not_look_truncated
+    page = search_page([7])
+    page["search"]["issueCount"] = 2
+    page["search"]["nodes"] << {}
+    gql = ->(q, _v) { q.include?("search(") ? page : { "repository" => { "pullRequest" => pr_node } } }
+    out = StringIO.new
+    GhTide::Stuck.main([], gql: gql, out: out, now: NOW, sleeper: ->(_) {})
+    refute_match(/Note: search returned only/, out.string)
+  end
+
+  # The search is by day; PRs merged before the exact --since window are dropped
+  def test_merged_unreleased_keeps_the_exact_window
+    api = ->(path) { path.end_with?("releases/latest") ? { "tag_name" => "v1" } : { "status" => "diverged" } }
+    opts = GhTide::Stuck.parse_args(%w[--merged-unreleased --since 12h])
+    nodes = [merged_node(4, "x", merged_at: "2026-01-20T06:00:00Z"), merged_node(5, "y", merged_at: "2026-01-19T20:00:00Z")]
+    r = GhTide::Stuck.load_unreleased(merged_gql(nodes), api, opts, NOW, ->(_) {}, ->(_) {})
+    assert_equal [4], r[:rows].map { |x| x[:number] }
+  end
+
+  # One PR that cannot be compared does not hide the rest of its repository
+  def test_merged_unreleased_keeps_going_after_one_failure
+    api = lambda do |path|
+      next { "tag_name" => "v1" } if path.end_with?("releases/latest")
+      raise GhTide::ApiError.new("HTTP 500", status: 500) if path.include?("...bad")
+
+      { "status" => "diverged" }
+    end
+    opts = GhTide::Stuck.parse_args(%w[--merged-unreleased])
+    r = GhTide::Stuck.load_unreleased(merged_gql([merged_node(4, "bad"), merged_node(5, "ok")]), api, opts, NOW, ->(_) {}, ->(_) {})
+    assert_equal [5], r[:rows].map { |x| x[:number] }
+    assert_equal [{ repo: "acme/api", stage: nil, count: 1, error: "#4: HTTP 500" }], r[:skipped]
   end
 end
