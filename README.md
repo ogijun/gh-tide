@@ -130,11 +130,12 @@ A PR gets every reason that applies. The first one, in this order, is the sectio
 | `waiting-review` | No approval yet. Shows the requested reviewers, or that nobody was asked |
 | `stacked` | The base branch is not the default branch. Shows the parent PR when an open PR in the same repository has that branch as its head |
 | `ci-pending` | Checks are still running and nothing else applies |
-| `ready-to-merge` | Approved, CI green, no conflicts, based on the default branch |
+| `ready-to-merge` | Approved, CI green, no conflicts, based on the default branch, and `mergeStateStatus` is `CLEAN`, `HAS_HOOKS`, or `UNSTABLE` |
+| `unknown` | Nothing above applies, but GitHub does not say it can merge (for example `BLOCKED` by unresolved conversations, or `BEHIND`); the merge state is shown |
 
 CI is judged the way [gh-tally](https://github.com/ogijun/gh-tally) does: for each workflow and event only the newest run counts, so a failure that a later run fixed is not a failure, and a cancelled run of a workflow that succeeded on the same commit (two runs started at once, one cancelled by concurrency) only looks red. When a job is re-run, its newest attempt counts.
 
-GitHub often reports mergeability as `UNKNOWN` right after many merges; `gh tide stuck` asks once more before giving up (the PR is then listed under `unknown`). Requests that fail with a server error are retried once, and a PR that still cannot be read is reported at the end without hiding the others.
+GitHub often reports mergeability as `UNKNOWN` right after many merges; `gh tide stuck` asks once more before giving up (the PR is then listed under `unknown`). Requests that fail with a server error or an HTML page instead of JSON are retried once, and a PR that still cannot be read is reported at the end without hiding the others.
 
 ### Merged but not released
 
