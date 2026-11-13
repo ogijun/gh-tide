@@ -34,6 +34,7 @@ module GhTide
       gh tide pr <number>      a PR (the merge commit if merged, otherwise the head commit)
       gh tide commit <sha>     a commit
       gh tide path <path>      whether a file or directory exists on each stage
+      gh tide stuck            open PRs that have not been merged, grouped by why (gh tide stuck --help)
 
     Options:
       -R, --repo <owner/repo>  target repository (default: the current one)
@@ -269,6 +270,8 @@ module GhTide
   end
 
   def main(argv, api = method(:gh_api), out = $stdout)
+    return Stuck.main(argv.drop(1), out: out) if argv.first == "stuck"
+
     opts = parse_args(argv)
     target = opts[:target]
     if opts[:command] == "help" || target.nil? || target.empty? || !%w[pr commit path].include?(opts[:command])

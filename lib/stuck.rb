@@ -82,7 +82,9 @@ module GhTide
         when "--author" then out[:author] = value.call(i += 1, a)
         when "--owner" then out[:owner] = value.call(i += 1, a)
         when "-R", "--repo" then out[:repo] = value.call(i += 1, a)
-        when "--min-age" then out[:min_age] = parse_duration(value.call(i += 1, a))
+        when "--min-age"
+          out[:min_age_label] = value.call(i += 1, a)
+          out[:min_age] = parse_duration(out[:min_age_label])
         when "--since" then out[:since] = parse_duration(value.call(i += 1, a))
         when "--stages" then out[:stages] = value.call(i += 1, a)
         when "--merged-unreleased" then out[:merged_unreleased] = true
@@ -162,7 +164,10 @@ module GhTide
       nodes(node, "reviewThreads").each do |t|
         next if t["isResolved"]
 
-        nodes(t, "comments").each { |c| conversation << { author: c["author"], at: c["createdAt"], reply: true } }
+        # Inline comments left with an approval are part of that approval
+        nodes(t, "comments").each do |c|
+          conversation << { author: c["author"], at: c["createdAt"], reply: c.dig("pullRequestReview", "state") != "APPROVED" }
+        end
       end
       {
         repo: node.dig("baseRepository", "nameWithOwner"),
@@ -355,11 +360,223 @@ module GhTide
           lines << "  #{ref}  #{ages}  #{truncate(x[:title], 72)}"
           extra = [x[:details][r]]
           others = x[:reasons] - [r]
+          others = others.map { |o| o == "stacked" && x[:parent] ? "stacked on ##{x[:parent]}" : o }
           extra << "also #{others.join(", ")}" if others.any?
           lines << "      #{extra.compact.join("; ")}"
         end
       end
       lines.join("\n")
+    end
+
+    # ---- gh I/O below ----
+
+    SEARCH_QUERY = <<~'GRAPHQL'
+      query($q: String!, $after: String) {
+        search(query: $q, type: ISSUE, first: 100, after: $after) {
+          issueCount
+          pageInfo { hasNextPage endCursor }
+          nodes { ... on PullRequest { number repository { nameWithOwner } } }
+        }
+      }
+    GRAPHQL
+
+    PR_QUERY = <<~'GRAPHQL'
+      query($owner: String!, $name: String!, $number: Int!) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $number) {
+            number title url createdAt isDraft
+            baseRefName headRefName headRefOid mergeable mergeStateStatus reviewDecision
+            author { __typename login }
+            baseRepository { nameWithOwner defaultBranchRef { name } }
+            reviewRequests(first: 20) {
+              nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } ... on Bot { login } ... on Mannequin { login } } }
+            }
+            latestOpinionatedReviews(first: 50) { nodes { state submittedAt author { __typename login } commit { oid } } }
+            reviews(last: 30) { nodes { state submittedAt author { __typename login } } }
+            comments(last: 30) { nodes { createdAt author { __typename login } } }
+            reviewThreads(last: 50) { nodes { isResolved comments(last: 1) { nodes { createdAt author { __typename login } pullRequestReview { state } } } } }
+            history: commits(last: 100) { nodes { commit { oid parents { totalCount } } } }
+            headCommit: commits(last: 1) {
+              nodes {
+                commit {
+                  oid committedDate
+                  statusCheckRollup {
+                    contexts(first: 100) {
+                      nodes {
+                        __typename
+                        ... on CheckRun {
+                          name status conclusion startedAt isRequired(pullRequestNumber: $number)
+                          checkSuite { workflowRun { databaseId runNumber event workflow { databaseId } } }
+                        }
+                        ... on StatusContext { context state createdAt isRequired(pullRequestNumber: $number) }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    GRAPHQL
+
+    PARENT_QUERY = <<~'GRAPHQL'
+      query($owner: String!, $name: String!, $head: String!) {
+        repository(owner: $owner, name: $name) {
+          pullRequests(headRefName: $head, states: OPEN, first: 5) { nodes { number headRepository { nameWithOwner } } }
+        }
+      }
+    GRAPHQL
+
+    def gh_graphql(query, vars)
+      args = ["gh", "api", "graphql", "-f", "query=#{query}"]
+      vars.each do |k, v|
+        next if v.nil?
+
+        args.push(v.is_a?(Integer) ? "-F" : "-f", "#{k}=#{v}")
+      end
+      body = JSON.parse(GhTide.run_command(*args))
+      raise ApiError, body["errors"].map { |e| e["message"] }.join("; ") if body["errors"] && body["data"].nil?
+
+      body["data"]
+    rescue CommandFailed => e
+      m = e.stderr.match(/HTTP (\d{3})/)
+      raise ApiError.new((e.stderr.empty? ? e.message : e.stderr).strip, status: m && m[1].to_i)
+    rescue JSON::ParserError => e
+      # GitHub sometimes answers a heavy GraphQL request with an HTML error page
+      raise ApiError, "unexpected response from GraphQL: #{e.message[0, 80]}"
+    end
+
+    # Retry once on errors that are not the caller's fault (5xx, HTML instead of JSON, timeouts)
+    def with_retry(sleeper)
+      yield
+    rescue ApiError => e
+      raise if e.status && e.status < 500
+
+      sleeper.call(2)
+      yield
+    end
+
+    def search(gql, query, sleeper)
+      found = []
+      after = nil
+      total = 0
+      10.times do
+        page = with_retry(sleeper) { gql.call(SEARCH_QUERY, { q: query, after: after }) }["search"]
+        total = page["issueCount"]
+        found.concat(page["nodes"].filter_map { |n| n["number"] && { repo: n.dig("repository", "nameWithOwner"), number: n["number"] } })
+        break unless page.dig("pageInfo", "hasNextPage")
+
+        after = page.dig("pageInfo", "endCursor")
+      end
+      [found, total]
+    end
+
+    def fetch_pr(gql, repo, number, sleeper)
+      owner, name = repo.split("/", 2)
+      vars = { owner: owner, name: name, number: number }
+      get = -> { with_retry(sleeper) { gql.call(PR_QUERY, vars) }.dig("repository", "pullRequest") }
+      node = get.call
+      # Right after many merges GitHub often has not computed mergeability yet; ask once more
+      if node["mergeable"] == "UNKNOWN" || node["mergeStateStatus"] == "UNKNOWN"
+        sleeper.call(2)
+        node = get.call
+      end
+      node
+    end
+
+    # The open PR in the same repository whose head branch is this PR's base
+    def find_parent(gql, pr, sleeper)
+      owner, name = pr[:repo].split("/", 2)
+      data = with_retry(sleeper) { gql.call(PARENT_QUERY, { owner: owner, name: name, head: pr[:base] }) }
+      hit = data.dig("repository", "pullRequests", "nodes").to_a.find do |n|
+        n.dig("headRepository", "nameWithOwner") == pr[:repo] && n["number"] != pr[:number]
+      end
+      hit && hit["number"]
+    end
+
+    def pool(items, size)
+      out = Array.new(items.length)
+      queue = Queue.new
+      items.each_index { |i| queue << i }
+      Array.new([size, items.length].min) do
+        Thread.new do
+          loop do
+            k = begin
+              queue.pop(true)
+            rescue ThreadError
+              break
+            end
+            out[k] = yield(items[k])
+          end
+        end
+      end.each(&:join)
+      out
+    end
+
+    def first_line(s)
+      s.to_s.split("\n", 2)[0] || ""
+    end
+
+    def load_open(gql, opts, now, sleeper)
+      found, total = search(gql, search_query(opts[:author], opts[:owner], opts[:repo]), sleeper)
+      results = pool(found, 4) do |f|
+        pr = normalize(fetch_pr(gql, f[:repo], f[:number], sleeper))
+        if pr[:default_branch] && pr[:base] != pr[:default_branch]
+          pr[:parent] = begin
+            find_parent(gql, pr, sleeper)
+          rescue ApiError
+            nil
+          end
+        end
+        classify(pr, now: now)
+      rescue StandardError => e
+        # One PR that cannot be read should not hide the rest
+        { repo: f[:repo], number: f[:number], error: first_line(e.message) }
+      end
+      errors, rows = results.partition { |r| r[:error] }
+      rows = rows.select { |r| r[:created_at] && now - r[:created_at] >= opts[:min_age] } if opts[:min_age]
+      { rows: rows, errors: errors, total: total, found: found.length }
+    end
+
+    def json_row(r)
+      {
+        repo: r[:repo], number: r[:number], title: r[:title], url: r[:url],
+        reason: r[:reason], reasons: r[:reasons], details: r[:details],
+        createdAt: r[:created_at]&.iso8601, lastActivityAt: r[:last_activity_at]&.iso8601,
+        ageDays: r[:age_days], idleDays: r[:idle_days], ci: r[:ci], base: r[:base], parent: r[:parent]
+      }
+    end
+
+    def main(argv, gql: method(:gh_graphql), out: $stdout, now: Time.now, sleeper: ->(s) { sleep(s) })
+      opts = parse_args(argv)
+      if opts[:help]
+        out.print(HELP)
+        return 0
+      end
+      result = load_open(gql, opts, now, sleeper)
+      rows = result[:rows]
+      who = opts[:author]
+      scope = opts[:repo] || opts[:owner]
+      header = "#{rows.length} open PRs by #{who}#{" in #{scope}" if scope}, drafts excluded"
+      header += ", opened at least #{opts[:min_age_label]} ago" if opts[:min_age]
+
+      if opts[:json]
+        out.print(JSON.pretty_generate(
+          author: who,
+          counts: REASONS.to_h { |r| [r, rows.count { |x| x[:reason] == r }] }.reject { |_, n| n.zero? },
+          prs: rows.sort_by { |r| [REASONS.index(r[:reason]), -(r[:age_days] || 0)] }.map { |r| json_row(r) },
+          errors: result[:errors],
+          truncated: result[:total] > result[:found]
+        ), "\n")
+        return 0
+      end
+      out.print(render(rows, header: header), "\n")
+      result[:errors].each { |e| out.print("Could not read #{e[:repo]}##{e[:number]}: #{e[:error]}\n") }
+      if result[:total] > result[:found]
+        out.print("Note: search returned only #{result[:found]} of #{result[:total]} PRs (the 1,000-result limit).\n")
+      end
+      0
     end
   end
 end
