@@ -418,4 +418,65 @@ class StuckTest < Minitest::Test
     GhTide::Stuck.main([], gql: gql, out: out, now: NOW, sleeper: ->(_) {})
     assert_match(%r{Could not read acme/api#8: HTTP 404}, out.string)
   end
+
+  # ---- --merged-unreleased ----
+
+  def merged_node(number, oid, repo: "acme/api", merged_at: "2026-01-15T00:00:00Z")
+    { "number" => number, "title" => "Merged #{number}", "url" => "https://github.com/#{repo}/pull/#{number}",
+      "mergedAt" => merged_at, "mergeCommit" => { "oid" => oid },
+      "repository" => { "nameWithOwner" => repo, "defaultBranchRef" => { "name" => "main" } } }
+  end
+
+  def merged_gql(nodes)
+    lambda do |q, _v|
+      next { "search" => { "issueCount" => 0, "pageInfo" => { "hasNextPage" => false }, "nodes" => [] } } unless q.include?("mergedAt")
+
+      { "search" => { "issueCount" => nodes.length, "pageInfo" => { "hasNextPage" => false }, "nodes" => nodes } }
+    end
+  end
+
+  def test_merged_query
+    assert_equal "is:pr is:merged author:@me merged:>=2025-12-21 user:acme",
+                 GhTide::Stuck.merged_query("@me", "acme", nil, NOW - (30 * 86_400))
+  end
+
+  # Only the last stage is checked; a PR whose merge commit is not on it is listed
+  def test_merged_unreleased_checks_the_last_stage
+    calls = []
+    api = lambda do |path|
+      calls << path
+      next [{ "name" => "prod-20260110" }, { "name" => "prod-20260118" }] if path.include?("/tags?")
+      next { "status" => "behind" } if path.include?("...old")
+
+      { "status" => "ahead" }
+    end
+    opts = GhTide::Stuck.parse_args(%w[--merged-unreleased])
+    r = GhTide::Stuck.load_unreleased(merged_gql([merged_node(4, "old"), merged_node(5, "new")]), api, opts, NOW, ->(_) {},
+                                      ->(_) { "develop,main,tag:^prod-" })
+    assert_equal [5], r[:rows].map { |x| x[:number] }
+    assert_equal "tag:^prod-", r[:rows][0][:stage]
+    assert_equal "prod-20260118", r[:rows][0][:ref]
+    assert(calls.none? { |c| c.include?("compare/develop") })
+  end
+
+  # Without stages the default is "<default branch>,release"; no release at all means the repository is skipped
+  def test_merged_unreleased_skips_a_repository_without_the_stage
+    api = ->(_path) { raise GhTide::ApiError.new("HTTP 404", status: 404) }
+    opts = GhTide::Stuck.parse_args(%w[--merged-unreleased])
+    r = GhTide::Stuck.load_unreleased(merged_gql([merged_node(4, "x")]), api, opts, NOW, ->(_) {}, ->(_) {})
+    assert_empty r[:rows]
+    assert_equal [{ repo: "acme/api", stage: "release", count: 1, error: "the stage could not be resolved" }], r[:skipped]
+  end
+
+  def test_main_prints_the_merged_unreleased_section
+    api = lambda do |path|
+      next { "tag_name" => "v1.2.0" } if path.end_with?("releases/latest")
+
+      { "status" => "diverged" }
+    end
+    out = StringIO.new
+    GhTide::Stuck.main(%w[--merged-unreleased --since 2w], gql: merged_gql([merged_node(4, "x")]), api: api, out: out,
+                                                          now: NOW, sleeper: ->(_) {}, stage_spec: ->(_) {})
+    assert_match(%r{merged-unreleased \(1\) — merged in the last 2w, not yet on the last stage\n  acme/api#4  merged 5d ago\s+Merged 4\n      not on release \(v1\.2\.0\)}, out.string)
+  end
 end
